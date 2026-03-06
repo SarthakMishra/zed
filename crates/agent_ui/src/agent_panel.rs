@@ -542,6 +542,33 @@ impl ActiveView {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct AgentTabId(usize);
+
+enum AgentTabKind {
+    AgentThread {
+        server_view: Entity<ConnectionView>,
+    },
+    TextThread {
+        text_thread_editor: Entity<TextThreadEditor>,
+        title_editor: Entity<Editor>,
+        buffer_search_bar: Entity<BufferSearchBar>,
+        _subscriptions: Vec<gpui::Subscription>,
+    },
+}
+
+struct AgentTab {
+    id: AgentTabId,
+    kind: AgentTabKind,
+    agent_type: AgentType,
+}
+
+/// Temporary overlay on top of tab content (not a tab itself).
+enum OverlayView {
+    History { kind: HistoryKind },
+    Configuration,
+}
+
 pub struct AgentPanel {
     workspace: WeakEntity<Workspace>,
     /// Workspace id is used as a database key
@@ -561,6 +588,14 @@ pub struct AgentPanel {
     focus_handle: FocusHandle,
     active_view: ActiveView,
     previous_view: Option<ActiveView>,
+    // Tab system fields
+    tabs: Vec<AgentTab>,
+    active_tab_index: usize,
+    next_tab_id: usize,
+    overlay_view: Option<OverlayView>,
+    tab_scroll_handle: gpui::ScrollHandle,
+    _active_tab_observation: Option<Subscription>,
+    _active_tab_thread_subscription: Option<Subscription>,
     background_threads: HashMap<acp::SessionId, Entity<ConnectionView>>,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
     start_thread_in_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -886,6 +921,13 @@ impl AgentPanel {
             focus_handle: cx.focus_handle(),
             context_server_registry,
             previous_view: None,
+            tabs: Vec::new(),
+            active_tab_index: 0,
+            next_tab_id: 0,
+            overlay_view: None,
+            tab_scroll_handle: gpui::ScrollHandle::new(),
+            _active_tab_observation: None,
+            _active_tab_thread_subscription: None,
             background_threads: HashMap::default(),
             new_thread_menu_handle: PopoverMenuHandle::default(),
             start_thread_in_menu_handle: PopoverMenuHandle::default(),
