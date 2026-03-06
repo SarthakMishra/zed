@@ -2534,9 +2534,7 @@ impl AgentPanel {
         // Check background threads
         if let Some(server_view) = self.background_threads.remove(&session_id) {
             self.add_tab(
-                AgentTabKind::AgentThread {
-                    server_view: server_view.clone(),
-                },
+                AgentTabKind::AgentThread { server_view },
                 self.selected_agent.clone(),
                 true,
                 window,
@@ -4628,7 +4626,7 @@ impl AgentPanel {
                     .icon_size(IconSize::Small)
                     .tooltip(Tooltip::text("New Thread"))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.new_thread(&NewThread::default(), window, cx);
+                        this.new_thread(&NewThread, window, cx);
                     })),
             )
             .into_any_element()
