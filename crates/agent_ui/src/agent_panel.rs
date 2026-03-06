@@ -460,6 +460,7 @@ impl ActiveView {
         }
     }
 
+    #[allow(dead_code)]
     pub fn text_thread(
         text_thread_editor: Entity<TextThreadEditor>,
         language_registry: Arc<LanguageRegistry>,
@@ -645,6 +646,7 @@ impl AgentTabKind {
     }
 }
 
+#[allow(dead_code)]
 struct AgentTab {
     id: AgentTabId,
     kind: AgentTabKind,
@@ -658,6 +660,7 @@ enum OverlayView {
 }
 
 /// What to actually display — resolved from overlay + active tab.
+#[allow(dead_code)]
 enum EffectiveView<'a> {
     Uninitialized,
     AgentThread {
@@ -2257,6 +2260,7 @@ impl AgentPanel {
         }
     }
 
+    #[allow(dead_code)]
     fn effective_view(&self) -> EffectiveView<'_> {
         if let Some(overlay) = &self.overlay_view {
             match overlay {
@@ -4567,7 +4571,7 @@ impl AgentPanel {
 }
 
 impl AgentPanel {
-    fn render_tab_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tab_bar(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.tabs.is_empty() {
             return div().into_any_element();
         }
