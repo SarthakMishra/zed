@@ -131,6 +131,10 @@ struct SerializedAgentPanel {
     last_active_thread: Option<SerializedActiveThread>,
     #[serde(default)]
     start_thread_in: Option<StartThreadIn>,
+    #[serde(default)]
+    tabs: Vec<SerializedTab>,
+    #[serde(default)]
+    active_tab_index: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -139,6 +143,14 @@ struct SerializedActiveThread {
     agent_type: AgentType,
     title: Option<String>,
     cwd: Option<std::path::PathBuf>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct SerializedTab {
+    session_id: String,
+    agent_type: AgentType,
+    title: Option<String>,
+    cwd: Option<PathBuf>,
 }
 
 pub fn init(cx: &mut App) {
@@ -738,6 +750,43 @@ impl AgentPanel {
             }
         });
 
+        // Serialize all open tabs
+        let tabs: Vec<SerializedTab> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                match &tab.kind {
+                    AgentTabKind::AgentThread { server_view } => {
+                        let sv = server_view.read(cx);
+                        // Only serialize threads that have a session
+                        sv.active_thread().map(|tv| {
+                            let thread = tv.read(cx).thread.read(cx);
+                            let title = thread.title();
+                            SerializedTab {
+                                session_id: thread.session_id().0.to_string(),
+                                agent_type: tab.agent_type.clone(),
+                                title: if title.as_ref() != DEFAULT_THREAD_TITLE {
+                                    Some(title.to_string())
+                                } else {
+                                    None
+                                },
+                                cwd: None,
+                            }
+                        })
+                    }
+                    AgentTabKind::TextThread { .. } => {
+                        // Text threads are not persisted via session_id; skip for now
+                        None
+                    }
+                }
+            })
+            .collect();
+        let active_tab_index = if tabs.is_empty() {
+            None
+        } else {
+            Some(self.active_tab_index.min(tabs.len().saturating_sub(1)))
+        };
+
         self.pending_serialization = Some(cx.background_spawn(async move {
             save_serialized_panel(
                 workspace_id,
@@ -746,6 +795,8 @@ impl AgentPanel {
                     selected_agent: Some(selected_agent),
                     last_active_thread,
                     start_thread_in,
+                    tabs,
+                    active_tab_index,
                 },
             )
             .await?;
@@ -854,7 +905,43 @@ impl AgentPanel {
                     });
                 }
 
-                if let Some(thread_info) = last_active_thread {
+                // Restore tabs if available, otherwise fall back to single thread
+                let serialized_tabs = serialized_panel
+                    .as_ref()
+                    .map(|p| p.tabs.clone())
+                    .unwrap_or_default();
+                let saved_active_index = serialized_panel
+                    .as_ref()
+                    .and_then(|p| p.active_tab_index);
+
+                if !serialized_tabs.is_empty() {
+                    for (i, tab) in serialized_tabs.iter().enumerate() {
+                        let agent_type = tab.agent_type.clone();
+                        let session_info = AgentSessionInfo {
+                            session_id: acp::SessionId::new(tab.session_id.clone()),
+                            cwd: tab.cwd.clone(),
+                            title: tab.title.clone().map(SharedString::from),
+                            updated_at: None,
+                            meta: None,
+                        };
+                        let is_last = i == serialized_tabs.len() - 1;
+                        panel.update(cx, |panel, cx| {
+                            panel.selected_agent = agent_type;
+                            panel.load_agent_thread(session_info, window, cx);
+                        });
+                        // After loading the last tab, set the active index
+                        if is_last {
+                            if let Some(active_idx) = saved_active_index {
+                                panel.update(cx, |panel, cx| {
+                                    if active_idx < panel.tabs.len() {
+                                        panel.activate_tab(active_idx, false, window, cx);
+                                    }
+                                });
+                            }
+                        }
+                    }
+                } else if let Some(thread_info) = last_active_thread {
+                    // Backward compat: restore single thread as a tab
                     let agent_type = thread_info.agent_type.clone();
                     let session_info = AgentSessionInfo {
                         session_id: acp::SessionId::new(thread_info.session_id),
