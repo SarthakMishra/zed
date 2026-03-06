@@ -1117,6 +1117,11 @@
     //
     // Default: false
     "show_turn_stats": false,
+    // Whether creating a new thread (ctrl+n) opens it in a new tab
+    // instead of replacing the current session.
+    //
+    // Default: true
+    "new_thread_opens_tab": true,
   },
   // Whether the screen sharing icon is shown in the os status bar.
   "show_call_status_icon": true,

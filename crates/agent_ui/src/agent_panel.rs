@@ -1243,6 +1243,11 @@ impl AgentPanel {
     }
 
     pub fn new_thread(&mut self, _action: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
+        let opens_tab = AgentSettings::get_global(cx).new_thread_opens_tab;
+        if !opens_tab && !self.tabs.is_empty() {
+            // Replace current tab: close it first, then create new
+            self.close_tab(self.active_tab_index, window, cx);
+        }
         self.new_agent_thread(AgentType::NativeAgent, window, cx);
     }
 
@@ -4294,7 +4299,11 @@ impl AgentPanel {
                             }
                             _ => selected_agent.into_any_element(),
                         })
-                        .child(self.render_title_view(window, cx)),
+                        .child(if self.tabs.len() >= 2 {
+                            self.render_inline_tabs(cx).into_any()
+                        } else {
+                            self.render_title_view(window, cx)
+                        }),
                 )
                 .child(
                     h_flex()
@@ -4753,6 +4762,60 @@ impl AgentPanel {
 }
 
 impl AgentPanel {
+    fn render_inline_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
+        let tab_count = self.tabs.len();
+        let active_index = self.active_tab_index;
+
+        let tabs: Vec<_> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(ix, tab)| {
+                let title: SharedString = match &tab.kind {
+                    AgentTabKind::AgentThread { server_view } => server_view.read(cx).title(cx),
+                    AgentTabKind::TextThread {
+                        text_thread_editor, ..
+                    } => text_thread_editor.read(cx).title(cx),
+                };
+
+                let is_active = ix == active_index;
+                let position = if ix == 0 {
+                    TabPosition::First
+                } else if ix == tab_count - 1 {
+                    TabPosition::Last
+                } else {
+                    TabPosition::Middle(ix.cmp(&active_index))
+                };
+
+                Tab::new(("agent-tab", ix))
+                    .position(position)
+                    .toggle_state(is_active)
+                    .child(Label::new(title).size(LabelSize::Small))
+                    .end_slot(
+                        IconButton::new(("close-tab", ix), IconName::Close)
+                            .icon_size(IconSize::XSmall)
+                            .visible_on_hover("")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.close_tab(ix, window, cx);
+                            })),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.activate_tab(ix, true, window, cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+
+        h_flex()
+            .id("agent-inline-tabs")
+            .flex_grow()
+            .overflow_x_scroll()
+            .track_scroll(&self.tab_scroll_handle)
+            .children(tabs)
+            .into_any()
+    }
+
+    #[allow(dead_code)]
     fn render_tab_bar(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.tabs.is_empty() {
             return div().into_any_element();
@@ -4857,7 +4920,6 @@ impl Render for AgentPanel {
                 }
             }))
             .child(self.render_toolbar(window, cx))
-            .child(self.render_tab_bar(window, cx))
             .children(self.render_worktree_creation_status(cx))
             .children(self.render_workspace_trust_message(cx))
             .children(self.render_onboarding(window, cx))

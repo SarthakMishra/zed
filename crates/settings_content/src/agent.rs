@@ -111,6 +111,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: false
     pub show_turn_stats: Option<bool>,
+    /// Whether creating a new thread (ctrl+n) opens it in a new tab instead of replacing the current session.
+    ///
+    /// Default: true
+    pub new_thread_opens_tab: Option<bool>,
     /// Per-tool permission rules for granular control over which tool actions
     /// require confirmation.
     ///
