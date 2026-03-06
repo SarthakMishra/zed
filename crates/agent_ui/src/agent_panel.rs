@@ -6,7 +6,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
 };
 
 use acp_thread::{AcpThread, AgentSessionInfo, MentionUri, ThreadStatus};
@@ -49,7 +48,7 @@ use agent_settings::AgentSettings;
 use ai_onboarding::AgentPanelOnboarding;
 use anyhow::{Result, anyhow};
 use assistant_slash_command::SlashCommandWorkingSet;
-use assistant_text_thread::{TextThread, TextThreadEvent, TextThreadSummary};
+use assistant_text_thread::{TextThread, TextThreadEvent};
 use client::UserStore;
 use cloud_api_types::Plan;
 use collections::HashMap;
@@ -59,9 +58,9 @@ use extension_host::ExtensionStore;
 use fs::Fs;
 use git::repository::validate_worktree_directory;
 use gpui::{
-    Action, Animation, AnimationExt, AnyElement, App, AsyncWindowContext, ClipboardItem, Corner,
-    DismissEvent, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels,
-    Subscription, Task, UpdateGlobal, WeakEntity, prelude::*, pulsating_between,
+    Action, AnyElement, App, AsyncWindowContext, ClipboardItem, Corner, DismissEvent, Entity,
+    EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels, Subscription, Task,
+    UpdateGlobal, WeakEntity, prelude::*,
 };
 use language::LanguageRegistry;
 use language_model::{ConfigurationError, LanguageModelRegistry};
@@ -370,7 +369,7 @@ enum ActiveView {
     },
     TextThread {
         text_thread_editor: Entity<TextThreadEditor>,
-        title_editor: Entity<Editor>,
+        _title_editor: Entity<Editor>,
         buffer_search_bar: Entity<BufferSearchBar>,
         _subscriptions: Vec<gpui::Subscription>,
     },
@@ -400,20 +399,6 @@ pub enum AgentType {
 impl AgentType {
     pub fn is_native(&self) -> bool {
         matches!(self, Self::NativeAgent)
-    }
-
-    fn label(&self) -> SharedString {
-        match self {
-            Self::NativeAgent | Self::TextThread => "Zed Agent".into(),
-            Self::Custom { name, .. } => name.into(),
-        }
-    }
-
-    fn icon(&self) -> Option<IconName> {
-        match self {
-            Self::NativeAgent | Self::TextThread => None,
-            Self::Custom { .. } => Some(IconName::Sparkle),
-        }
     }
 }
 
@@ -542,7 +527,7 @@ impl ActiveView {
 
         Self::TextThread {
             text_thread_editor,
-            title_editor: editor,
+            _title_editor: editor,
             buffer_search_bar,
             _subscriptions: subscriptions,
         }
@@ -2080,7 +2065,7 @@ impl AgentPanel {
                 _subscriptions,
             } => ActiveView::TextThread {
                 text_thread_editor: text_thread_editor.clone(),
-                title_editor: title_editor.clone(),
+                _title_editor: title_editor.clone(),
                 buffer_search_bar: buffer_search_bar.clone(),
                 _subscriptions: Vec::new(), // subscriptions are owned by AgentTabKind
             },
@@ -2111,6 +2096,9 @@ impl AgentPanel {
         self.active_tab_index = index;
         self.overlay_view = None;
 
+        // Scroll the activated tab into view
+        self.tab_scroll_handle.scroll_to_item(index);
+
         // Update active_view for backward compat
         let active_view = match &self.tabs[index].kind {
             AgentTabKind::AgentThread { server_view } => ActiveView::AgentThread {
@@ -2123,7 +2111,7 @@ impl AgentPanel {
                 ..
             } => ActiveView::TextThread {
                 text_thread_editor: text_thread_editor.clone(),
-                title_editor: title_editor.clone(),
+                _title_editor: title_editor.clone(),
                 buffer_search_bar: buffer_search_bar.clone(),
                 _subscriptions: Vec::new(),
             },
@@ -2214,7 +2202,7 @@ impl AgentPanel {
                         ..
                     } => ActiveView::TextThread {
                         text_thread_editor: text_thread_editor.clone(),
-                        title_editor: title_editor.clone(),
+                        _title_editor: title_editor.clone(),
                         buffer_search_bar: buffer_search_bar.clone(),
                         _subscriptions: Vec::new(),
                     },
@@ -3272,140 +3260,6 @@ impl Panel for AgentPanel {
 }
 
 impl AgentPanel {
-    fn render_title_view(&self, _window: &mut Window, cx: &Context<Self>) -> AnyElement {
-        const LOADING_SUMMARY_PLACEHOLDER: &str = "Loading Summary…";
-
-        let content = match &self.active_view {
-            ActiveView::AgentThread { server_view } => {
-                let is_generating_title = server_view
-                    .read(cx)
-                    .as_native_thread(cx)
-                    .map_or(false, |t| t.read(cx).is_generating_title());
-
-                if let Some(title_editor) = server_view
-                    .read(cx)
-                    .parent_thread(cx)
-                    .map(|r| r.read(cx).title_editor.clone())
-                {
-                    let container = div()
-                        .w_full()
-                        .on_action({
-                            let thread_view = server_view.downgrade();
-                            move |_: &menu::Confirm, window, cx| {
-                                if let Some(thread_view) = thread_view.upgrade() {
-                                    thread_view.focus_handle(cx).focus(window, cx);
-                                }
-                            }
-                        })
-                        .on_action({
-                            let thread_view = server_view.downgrade();
-                            move |_: &editor::actions::Cancel, window, cx| {
-                                if let Some(thread_view) = thread_view.upgrade() {
-                                    thread_view.focus_handle(cx).focus(window, cx);
-                                }
-                            }
-                        })
-                        .child(title_editor);
-
-                    if is_generating_title {
-                        container
-                            .with_animation(
-                                "generating_title",
-                                Animation::new(Duration::from_secs(2))
-                                    .repeat()
-                                    .with_easing(pulsating_between(0.4, 0.8)),
-                                |div, delta| div.opacity(delta),
-                            )
-                            .into_any_element()
-                    } else {
-                        container.into_any_element()
-                    }
-                } else {
-                    Label::new(server_view.read(cx).title(cx))
-                        .color(Color::Muted)
-                        .truncate()
-                        .into_any_element()
-                }
-            }
-            ActiveView::TextThread {
-                title_editor,
-                text_thread_editor,
-                ..
-            } => {
-                let summary = text_thread_editor.read(cx).text_thread().read(cx).summary();
-
-                match summary {
-                    TextThreadSummary::Pending => Label::new(TextThreadSummary::DEFAULT)
-                        .color(Color::Muted)
-                        .truncate()
-                        .into_any_element(),
-                    TextThreadSummary::Content(summary) => {
-                        if summary.done {
-                            div()
-                                .w_full()
-                                .child(title_editor.clone())
-                                .into_any_element()
-                        } else {
-                            Label::new(LOADING_SUMMARY_PLACEHOLDER)
-                                .truncate()
-                                .color(Color::Muted)
-                                .with_animation(
-                                    "generating_title",
-                                    Animation::new(Duration::from_secs(2))
-                                        .repeat()
-                                        .with_easing(pulsating_between(0.4, 0.8)),
-                                    |label, delta| label.alpha(delta),
-                                )
-                                .into_any_element()
-                        }
-                    }
-                    TextThreadSummary::Error => h_flex()
-                        .w_full()
-                        .child(title_editor.clone())
-                        .child(
-                            IconButton::new("retry-summary-generation", IconName::RotateCcw)
-                                .icon_size(IconSize::Small)
-                                .on_click({
-                                    let text_thread_editor = text_thread_editor.clone();
-                                    move |_, _window, cx| {
-                                        text_thread_editor.update(cx, |text_thread_editor, cx| {
-                                            text_thread_editor.regenerate_summary(cx);
-                                        });
-                                    }
-                                })
-                                .tooltip(move |_window, cx| {
-                                    cx.new(|_| {
-                                        Tooltip::new("Failed to generate title")
-                                            .meta("Click to try again")
-                                    })
-                                    .into()
-                                }),
-                        )
-                        .into_any_element(),
-                }
-            }
-            ActiveView::History { kind } => {
-                let title = match kind {
-                    HistoryKind::AgentThreads => "History",
-                    HistoryKind::TextThreads => "Text Thread History",
-                };
-                Label::new(title).truncate().into_any_element()
-            }
-            ActiveView::Configuration => Label::new("Settings").truncate().into_any_element(),
-            ActiveView::Uninitialized => Label::new("Agent").truncate().into_any_element(),
-        };
-
-        h_flex()
-            .key_context("TitleEditor")
-            .id("TitleEditor")
-            .flex_grow()
-            .w_full()
-            .max_w_full()
-            .overflow_x_scroll()
-            .child(content)
-            .into_any()
-    }
-
     fn handle_regenerate_thread_title(thread_view: Entity<ConnectionView>, cx: &mut App) {
         thread_view.update(cx, |thread_view, cx| {
             if let Some(thread) = thread_view.as_native_thread(cx) {
@@ -3707,19 +3561,6 @@ impl AgentPanel {
     fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let agent_server_store = self.project.read(cx).agent_server_store().clone();
         let focus_handle = self.focus_handle(cx);
-
-        let (selected_agent_custom_icon, selected_agent_label) =
-            if let AgentType::Custom { name, .. } = &self.selected_agent {
-                let store = agent_server_store.read(cx);
-                let icon = store.agent_icon(&ExternalAgentServerName(name.clone()));
-
-                let label = store
-                    .agent_display_name(&ExternalAgentServerName(name.clone()))
-                    .unwrap_or_else(|| self.selected_agent.label());
-                (icon, label)
-            } else {
-                (None, self.selected_agent.label())
-            };
 
         let active_thread = match &self.active_view {
             ActiveView::AgentThread { server_view } => server_view.read(cx).as_native_thread(cx),
@@ -4053,44 +3894,15 @@ impl AgentPanel {
                 }
             });
 
-        let is_thread_loading = self
-            .active_connection_view()
-            .map(|thread| thread.read(cx).is_loading())
-            .unwrap_or(false);
-
-        let has_custom_icon = selected_agent_custom_icon.is_some();
-
-        let selected_agent = div()
-            .id("selected_agent_icon")
-            .when_some(selected_agent_custom_icon, |this, icon_path| {
-                this.px_1()
-                    .child(Icon::from_external_svg(icon_path).color(Color::Muted))
-            })
-            .when(!has_custom_icon, |this| {
-                this.when_some(self.selected_agent.icon(), |this, icon| {
-                    this.px_1().child(Icon::new(icon).color(Color::Muted))
-                })
-            })
-            .tooltip(move |_, cx| {
-                Tooltip::with_meta(selected_agent_label.clone(), None, "Selected Agent", cx)
-            });
-
-        let selected_agent = if is_thread_loading {
-            selected_agent
-                .with_animation(
-                    "pulsating-icon",
-                    Animation::new(Duration::from_secs(1))
-                        .repeat()
-                        .with_easing(pulsating_between(0.2, 0.6)),
-                    |icon, delta| icon.opacity(delta),
-                )
-                .into_any_element()
-        } else {
-            selected_agent.into_any_element()
-        };
-
         let show_history_menu = self.history_kind_for_selected_agent(cx).is_some();
         let has_v2_flag = cx.has_flag::<AgentV2FeatureFlag>();
+
+        let has_focus = self.focus_handle(cx).contains_focused(window, cx);
+        let menu_focused = self.new_thread_menu_handle.is_focused(window, cx)
+            || self.start_thread_in_menu_handle.is_focused(window, cx)
+            || self.agent_panel_menu_handle.is_focused(window, cx)
+            || self.agent_navigation_menu_handle.is_focused(window, cx);
+        let show_right_buttons = has_focus || menu_focused;
 
         h_flex()
             .id("agent-panel-toolbar")
@@ -4098,47 +3910,48 @@ impl AgentPanel {
             .max_w_full()
             .flex_none()
             .justify_between()
-            .gap_2()
             .bg(cx.theme().colors().tab_bar_background)
-            .border_b_1()
-            .border_color(cx.theme().colors().border)
             .child(
                 h_flex()
-                    .size_full()
-                    .gap(DynamicSpacing::Base04.rems(cx))
-                    .pl(DynamicSpacing::Base04.rems(cx))
-                    .child(match &self.active_view {
-                        ActiveView::History { .. } | ActiveView::Configuration => {
-                            self.render_toolbar_back_button(cx).into_any_element()
-                        }
-                        _ => selected_agent.into_any_element(),
-                    })
-                    .child(if self.tabs.len() >= 2 {
-                        self.render_inline_tabs(cx).into_any()
-                    } else {
-                        self.render_title_view(window, cx)
-                    }),
-            )
-            .child(
-                h_flex()
-                    .flex_none()
-                    .gap(DynamicSpacing::Base02.rems(cx))
-                    .pl(DynamicSpacing::Base04.rems(cx))
-                    .pr(DynamicSpacing::Base06.rems(cx))
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
                     .when(
-                        has_v2_flag && !self.active_thread_has_messages(cx),
-                        |this| this.child(self.render_start_thread_in_selector(cx)),
+                        matches!(
+                            &self.active_view,
+                            ActiveView::History { .. } | ActiveView::Configuration
+                        ),
+                        |this| this.child(self.render_toolbar_back_button(cx).into_any_element()),
                     )
-                    .child(new_thread_menu)
-                    .when(show_history_menu, |this| {
-                        this.child(self.render_recent_entries_menu(
-                            IconName::MenuAltTemp,
-                            Corner::TopRight,
-                            cx,
-                        ))
-                    })
-                    .child(self.render_panel_options_menu(window, cx)),
+                    .child(self.render_inline_tabs(cx)),
             )
+            .when(show_right_buttons, |this| {
+                this.child(
+                    h_flex()
+                        .flex_none()
+                        .h_full()
+                        .items_center()
+                        .gap(DynamicSpacing::Base02.rems(cx))
+                        .pl(DynamicSpacing::Base04.rems(cx))
+                        .pr(DynamicSpacing::Base06.rems(cx))
+                        .border_b_1()
+                        .border_l_1()
+                        .border_color(cx.theme().colors().border)
+                        .when(
+                            has_v2_flag && !self.active_thread_has_messages(cx),
+                            |this| this.child(self.render_start_thread_in_selector(cx)),
+                        )
+                        .child(new_thread_menu)
+                        .when(show_history_menu, |this| {
+                            this.child(self.render_recent_entries_menu(
+                                IconName::MenuAltTemp,
+                                Corner::TopRight,
+                                cx,
+                            ))
+                        })
+                        .child(self.render_panel_options_menu(window, cx)),
+                )
+            })
     }
 
     fn render_worktree_creation_status(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -4622,12 +4435,29 @@ impl AgentPanel {
             })
             .collect();
 
-        h_flex()
-            .id("agent-inline-tabs")
-            .flex_grow()
-            .overflow_x_scroll()
-            .track_scroll(&self.tab_scroll_handle)
-            .children(tabs)
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .relative()
+            // Absolute bottom border spanning full width (like TabBar in pane.rs)
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border),
+            )
+            .child(
+                h_flex()
+                    .id("agent-inline-tabs")
+                    .flex_grow()
+                    .overflow_x_scroll()
+                    .track_scroll(&self.tab_scroll_handle)
+                    .children(tabs),
+            )
             .into_any()
     }
 
