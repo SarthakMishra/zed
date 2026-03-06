@@ -2015,13 +2015,25 @@ impl AgentPanel {
         }
         self.active_tab_index = index;
         self.overlay_view = None;
-        self.refresh_active_tab_subscriptions(window, cx);
-        if focus {
-            self.focus_handle(cx).focus(window, cx);
-        }
-        cx.emit(AgentPanelEvent::ActiveViewChanged);
-        self.serialize(cx);
-        cx.notify();
+
+        // Update active_view for backward compat
+        let active_view = match &self.tabs[index].kind {
+            AgentTabKind::AgentThread { server_view } => ActiveView::AgentThread {
+                server_view: server_view.clone(),
+            },
+            AgentTabKind::TextThread {
+                text_thread_editor,
+                title_editor,
+                buffer_search_bar,
+                ..
+            } => ActiveView::TextThread {
+                text_thread_editor: text_thread_editor.clone(),
+                title_editor: title_editor.clone(),
+                buffer_search_bar: buffer_search_bar.clone(),
+                _subscriptions: Vec::new(),
+            },
+        };
+        self.set_active_view(active_view, focus, window, cx);
     }
 
     fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -2038,6 +2050,7 @@ impl AgentPanel {
         if self.tabs.is_empty() {
             self.active_tab_index = 0;
             // Show history when last tab is closed
+            self.active_view = ActiveView::Uninitialized;
             self.show_overlay(
                 OverlayView::History {
                     kind: self
@@ -2048,9 +2061,15 @@ impl AgentPanel {
                 window,
                 cx,
             );
+            // Also set via old path for compat
+            let kind = self
+                .history_kind_for_selected_agent(cx)
+                .unwrap_or(HistoryKind::AgentThreads);
+            self.set_active_view(ActiveView::History { kind }, false, window, cx);
         } else {
             self.active_tab_index = index.min(self.tabs.len() - 1);
-            self.refresh_active_tab_subscriptions(window, cx);
+            // Activate the new tab (which also updates active_view)
+            self.activate_tab(self.active_tab_index, false, window, cx);
         }
         cx.emit(AgentPanelEvent::ActiveViewChanged);
         self.serialize(cx);
@@ -2087,9 +2106,30 @@ impl AgentPanel {
     fn dismiss_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.overlay_view.is_some() {
             self.overlay_view = None;
-            self.refresh_active_tab_subscriptions(window, cx);
-            cx.emit(AgentPanelEvent::ActiveViewChanged);
-            cx.notify();
+            // Restore active_view to match the active tab
+            if let Some(tab) = self.tabs.get(self.active_tab_index) {
+                let active_view = match &tab.kind {
+                    AgentTabKind::AgentThread { server_view } => ActiveView::AgentThread {
+                        server_view: server_view.clone(),
+                    },
+                    AgentTabKind::TextThread {
+                        text_thread_editor,
+                        title_editor,
+                        buffer_search_bar,
+                        ..
+                    } => ActiveView::TextThread {
+                        text_thread_editor: text_thread_editor.clone(),
+                        title_editor: title_editor.clone(),
+                        buffer_search_bar: buffer_search_bar.clone(),
+                        _subscriptions: Vec::new(),
+                    },
+                };
+                self.set_active_view(active_view, true, window, cx);
+            } else {
+                self.refresh_active_tab_subscriptions(window, cx);
+                cx.emit(AgentPanelEvent::ActiveViewChanged);
+                cx.notify();
+            }
         }
     }
 
