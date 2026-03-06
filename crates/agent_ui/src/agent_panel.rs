@@ -557,6 +557,88 @@ enum AgentTabKind {
     },
 }
 
+impl AgentTabKind {
+    fn text_thread(
+        text_thread_editor: Entity<TextThreadEditor>,
+        language_registry: Arc<LanguageRegistry>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self {
+        let title = text_thread_editor.read(cx).title(cx).to_string();
+
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(title, window, cx);
+            editor
+        });
+
+        let mut suppress_first_edit = true;
+
+        let subscriptions = vec![
+            window.subscribe(&editor, cx, {
+                let text_thread_editor = text_thread_editor.clone();
+                move |editor, event, window, cx| match event {
+                    EditorEvent::BufferEdited => {
+                        if suppress_first_edit {
+                            suppress_first_edit = false;
+                            return;
+                        }
+                        let new_summary = editor.read(cx).text(cx);
+                        text_thread_editor.update(cx, |text_thread_editor, cx| {
+                            text_thread_editor
+                                .text_thread()
+                                .update(cx, |text_thread, cx| {
+                                    text_thread.set_custom_summary(new_summary, cx);
+                                })
+                        })
+                    }
+                    EditorEvent::Blurred => {
+                        if editor.read(cx).text(cx).is_empty() {
+                            let summary = text_thread_editor
+                                .read(cx)
+                                .text_thread()
+                                .read(cx)
+                                .summary()
+                                .or_default();
+
+                            editor.update(cx, |editor, cx| {
+                                editor.set_text(summary, window, cx);
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }),
+            window.subscribe(&text_thread_editor.read(cx).text_thread().clone(), cx, {
+                let editor = editor.clone();
+                move |text_thread, event, window, cx| match event {
+                    TextThreadEvent::SummaryGenerated => {
+                        let summary = text_thread.read(cx).summary().or_default();
+                        editor.update(cx, |editor, cx| {
+                            editor.set_text(summary, window, cx);
+                        })
+                    }
+                    TextThreadEvent::PathChanged { .. } => {}
+                    _ => {}
+                }
+            }),
+        ];
+
+        let buffer_search_bar =
+            cx.new(|cx| BufferSearchBar::new(Some(language_registry), window, cx));
+        buffer_search_bar.update(cx, |buffer_search_bar, cx| {
+            buffer_search_bar.set_active_pane_item(Some(&text_thread_editor), window, cx)
+        });
+
+        Self::TextThread {
+            text_thread_editor,
+            title_editor: editor,
+            buffer_search_bar,
+            _subscriptions: subscriptions,
+        }
+    }
+}
+
 struct AgentTab {
     id: AgentTabId,
     kind: AgentTabKind,
@@ -1132,17 +1214,13 @@ impl AgentPanel {
             self.serialize(cx);
         }
 
-        self.set_active_view(
-            ActiveView::text_thread(
-                text_thread_editor.clone(),
-                self.language_registry.clone(),
-                window,
-                cx,
-            ),
-            true,
+        let tab_kind = AgentTabKind::text_thread(
+            text_thread_editor.clone(),
+            self.language_registry.clone(),
             window,
             cx,
         );
+        self.add_tab(tab_kind, AgentType::TextThread, true, window, cx);
         text_thread_editor.focus_handle(cx).focus(window, cx);
     }
 
@@ -1356,12 +1434,9 @@ impl AgentPanel {
             self.serialize(cx);
         }
 
-        self.set_active_view(
-            ActiveView::text_thread(editor, self.language_registry.clone(), window, cx),
-            true,
-            window,
-            cx,
-        );
+        let tab_kind =
+            AgentTabKind::text_thread(editor, self.language_registry.clone(), window, cx);
+        self.add_tab(tab_kind, AgentType::TextThread, true, window, cx);
     }
 
     pub fn go_back(&mut self, _: &workspace::GoBack, window: &mut Window, cx: &mut Context<Self>) {
@@ -1902,6 +1977,25 @@ impl AgentPanel {
     ) {
         let id = AgentTabId(self.next_tab_id);
         self.next_tab_id += 1;
+
+        // Build the corresponding ActiveView for backward compat during transition
+        let active_view = match &kind {
+            AgentTabKind::AgentThread { server_view } => ActiveView::AgentThread {
+                server_view: server_view.clone(),
+            },
+            AgentTabKind::TextThread {
+                text_thread_editor,
+                title_editor,
+                buffer_search_bar,
+                _subscriptions,
+            } => ActiveView::TextThread {
+                text_thread_editor: text_thread_editor.clone(),
+                title_editor: title_editor.clone(),
+                buffer_search_bar: buffer_search_bar.clone(),
+                _subscriptions: Vec::new(), // subscriptions are owned by AgentTabKind
+            },
+        };
+
         self.tabs.push(AgentTab {
             id,
             kind,
@@ -1909,13 +2003,9 @@ impl AgentPanel {
         });
         self.active_tab_index = self.tabs.len() - 1;
         self.overlay_view = None;
-        self.refresh_active_tab_subscriptions(window, cx);
-        if focus {
-            self.focus_handle(cx).focus(window, cx);
-        }
-        cx.emit(AgentPanelEvent::ActiveViewChanged);
-        self.serialize(cx);
-        cx.notify();
+
+        // Update active_view for backward compat (existing render code reads this)
+        self.set_active_view(active_view, focus, window, cx);
     }
 
     fn activate_tab(
@@ -2333,11 +2423,37 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(server_view) = self.background_threads.remove(&session_id) {
-            self.set_active_view(ActiveView::AgentThread { server_view }, focus, window, cx);
+        // Check if already open in a tab — activate it instead of creating a new one
+        if let Some(tab_index) = self.tabs.iter().position(|tab| {
+            if let AgentTabKind::AgentThread { server_view } = &tab.kind {
+                server_view
+                    .read(cx)
+                    .active_thread()
+                    .map(|t| t.read(cx).id.clone())
+                    == Some(session_id.clone())
+            } else {
+                false
+            }
+        }) {
+            self.activate_tab(tab_index, true, window, cx);
             return;
         }
 
+        // Check background threads
+        if let Some(server_view) = self.background_threads.remove(&session_id) {
+            self.add_tab(
+                AgentTabKind::AgentThread {
+                    server_view: server_view.clone(),
+                },
+                self.selected_agent.clone(),
+                true,
+                window,
+                cx,
+            );
+            return;
+        }
+
+        // Check the current active_view (backward compat during transition)
         if let ActiveView::AgentThread { server_view } = &self.active_view {
             if server_view
                 .read(cx)
@@ -2434,7 +2550,15 @@ impl AgentPanel {
         })
         .detach();
 
-        self.set_active_view(ActiveView::AgentThread { server_view }, focus, window, cx);
+        self.add_tab(
+            AgentTabKind::AgentThread {
+                server_view: server_view.clone(),
+            },
+            self.selected_agent.clone(),
+            true,
+            window,
+            cx,
+        );
     }
 
     fn active_thread_has_messages(&self, cx: &App) -> bool {
