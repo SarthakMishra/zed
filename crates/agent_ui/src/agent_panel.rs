@@ -73,8 +73,9 @@ use search::{BufferSearchBar, buffer_search};
 use settings::{Settings, update_settings_file};
 use theme::ThemeSettings;
 use ui::{
-    Button, Callout, ContextMenu, ContextMenuEntry, DocumentationSide, KeyBinding, PopoverMenu,
-    PopoverMenuHandle, SpinnerLabel, Tab, Tooltip, prelude::*, utils::WithRemSize,
+    Button, Callout, ContextMenu, ContextMenuEntry, DocumentationSide, IconButton, KeyBinding,
+    PopoverMenu, PopoverMenuHandle, SpinnerLabel, Tab, TabBar, TabPosition, Tooltip, prelude::*,
+    utils::WithRemSize,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -4438,6 +4439,71 @@ impl AgentPanel {
     }
 }
 
+impl AgentPanel {
+    fn render_tab_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.tabs.is_empty() {
+            return div().into_any_element();
+        }
+
+        let tab_count = self.tabs.len();
+        let active_index = self.active_tab_index;
+
+        let tabs: Vec<_> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(ix, tab)| {
+                let title: SharedString = match &tab.kind {
+                    AgentTabKind::AgentThread { server_view } => server_view.read(cx).title(cx),
+                    AgentTabKind::TextThread {
+                        text_thread_editor, ..
+                    } => text_thread_editor.read(cx).title(cx),
+                };
+
+                let is_active = ix == active_index;
+                let position = if tab_count == 1 {
+                    TabPosition::First
+                } else if ix == 0 {
+                    TabPosition::First
+                } else if ix == tab_count - 1 {
+                    TabPosition::Last
+                } else {
+                    TabPosition::Middle(ix.cmp(&active_index))
+                };
+
+                Tab::new(("agent-tab", ix))
+                    .position(position)
+                    .toggle_state(is_active)
+                    .child(Label::new(title).size(LabelSize::Small))
+                    .end_slot(
+                        IconButton::new(("close-tab", ix), IconName::Close)
+                            .icon_size(IconSize::XSmall)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.close_tab(ix, window, cx);
+                            })),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.activate_tab(ix, true, window, cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+
+        TabBar::new("agent-panel-tab-bar")
+            .track_scroll(&self.tab_scroll_handle)
+            .children(tabs)
+            .end_child(
+                IconButton::new("new-tab", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("New Thread"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.new_thread(&NewThread::default(), window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+}
+
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // WARNING: Changes to this element hierarchy can have
@@ -4478,6 +4544,7 @@ impl Render for AgentPanel {
                 }
             }))
             .child(self.render_toolbar(window, cx))
+            .child(self.render_tab_bar(window, cx))
             .children(self.render_worktree_creation_status(cx))
             .children(self.render_workspace_trust_message(cx))
             .children(self.render_onboarding(window, cx))
