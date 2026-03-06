@@ -382,7 +382,6 @@ enum ActiveView {
     },
     TextThread {
         text_thread_editor: Entity<TextThreadEditor>,
-        _title_editor: Entity<Editor>,
         buffer_search_bar: Entity<BufferSearchBar>,
         _subscriptions: Vec<gpui::Subscription>,
     },
@@ -450,94 +449,6 @@ impl ActiveView {
             ActiveView::Configuration => WhichFontSize::None,
         }
     }
-
-    #[allow(dead_code)]
-    pub fn text_thread(
-        text_thread_editor: Entity<TextThreadEditor>,
-        language_registry: Arc<LanguageRegistry>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Self {
-        let title = text_thread_editor.read(cx).title(cx).to_string();
-
-        let editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_text(title, window, cx);
-            editor
-        });
-
-        // This is a workaround for `editor.set_text` emitting a `BufferEdited` event, which would
-        // cause a custom summary to be set. The presence of this custom summary would cause
-        // summarization to not happen.
-        let mut suppress_first_edit = true;
-
-        let subscriptions = vec![
-            window.subscribe(&editor, cx, {
-                {
-                    let text_thread_editor = text_thread_editor.clone();
-                    move |editor, event, window, cx| match event {
-                        EditorEvent::BufferEdited => {
-                            if suppress_first_edit {
-                                suppress_first_edit = false;
-                                return;
-                            }
-                            let new_summary = editor.read(cx).text(cx);
-
-                            text_thread_editor.update(cx, |text_thread_editor, cx| {
-                                text_thread_editor
-                                    .text_thread()
-                                    .update(cx, |text_thread, cx| {
-                                        text_thread.set_custom_summary(new_summary, cx);
-                                    })
-                            })
-                        }
-                        EditorEvent::Blurred => {
-                            if editor.read(cx).text(cx).is_empty() {
-                                let summary = text_thread_editor
-                                    .read(cx)
-                                    .text_thread()
-                                    .read(cx)
-                                    .summary()
-                                    .or_default();
-
-                                editor.update(cx, |editor, cx| {
-                                    editor.set_text(summary, window, cx);
-                                });
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }),
-            window.subscribe(&text_thread_editor.read(cx).text_thread().clone(), cx, {
-                let editor = editor.clone();
-                move |text_thread, event, window, cx| match event {
-                    TextThreadEvent::SummaryGenerated => {
-                        let summary = text_thread.read(cx).summary().or_default();
-
-                        editor.update(cx, |editor, cx| {
-                            editor.set_text(summary, window, cx);
-                        })
-                    }
-                    TextThreadEvent::PathChanged { .. } => {}
-                    _ => {}
-                }
-            }),
-        ];
-
-        let buffer_search_bar =
-            cx.new(|cx| BufferSearchBar::new(Some(language_registry), window, cx));
-        buffer_search_bar.update(cx, |buffer_search_bar, cx| {
-            buffer_search_bar.set_active_pane_item(Some(&text_thread_editor), window, cx)
-        });
-
-        Self::TextThread {
-            text_thread_editor,
-            _title_editor: editor,
-            buffer_search_bar,
-            _subscriptions: subscriptions,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -549,7 +460,8 @@ enum AgentTabKind {
     },
     TextThread {
         text_thread_editor: Entity<TextThreadEditor>,
-        title_editor: Entity<Editor>,
+        /// Kept alive to hold subscriptions; not directly read.
+        _title_editor: Entity<Editor>,
         buffer_search_bar: Entity<BufferSearchBar>,
         _subscriptions: Vec<gpui::Subscription>,
     },
@@ -630,7 +542,7 @@ impl AgentTabKind {
 
         Self::TextThread {
             text_thread_editor,
-            title_editor: editor,
+            _title_editor: editor,
             buffer_search_bar,
             _subscriptions: subscriptions,
         }
@@ -647,24 +559,6 @@ struct AgentTab {
 /// Temporary overlay on top of tab content (not a tab itself).
 enum OverlayView {
     History { kind: HistoryKind },
-    Configuration,
-}
-
-/// What to actually display — resolved from overlay + active tab.
-#[allow(dead_code)]
-enum EffectiveView<'a> {
-    Uninitialized,
-    AgentThread {
-        server_view: &'a Entity<ConnectionView>,
-    },
-    TextThread {
-        text_thread_editor: &'a Entity<TextThreadEditor>,
-        title_editor: &'a Entity<Editor>,
-        buffer_search_bar: &'a Entity<BufferSearchBar>,
-    },
-    History {
-        kind: HistoryKind,
-    },
     Configuration,
 }
 
@@ -693,8 +587,6 @@ pub struct AgentPanel {
     next_tab_id: usize,
     overlay_view: Option<OverlayView>,
     tab_scroll_handle: gpui::ScrollHandle,
-    _active_tab_observation: Option<Subscription>,
-    _active_tab_thread_subscription: Option<Subscription>,
     background_threads: HashMap<acp::SessionId, Entity<ConnectionView>>,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
     start_thread_in_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -775,10 +667,26 @@ impl AgentPanel {
                 }
             })
             .collect();
-        let active_tab_index = if tabs.is_empty() {
-            None
-        } else {
-            Some(self.active_tab_index.min(tabs.len().saturating_sub(1)))
+        // Map active_tab_index to the serialized tab list (text threads are filtered out)
+        let active_tab_index = {
+            let mut mapped_index = None;
+            let mut serialized_ix = 0usize;
+            for (original_ix, tab) in self.tabs.iter().enumerate() {
+                if matches!(&tab.kind, AgentTabKind::AgentThread { .. }) {
+                    if original_ix == self.active_tab_index {
+                        mapped_index = Some(serialized_ix);
+                    }
+                    serialized_ix += 1;
+                }
+            }
+            // If active tab was a text thread (not serialized), default to last tab
+            mapped_index.or_else(|| {
+                if tabs.is_empty() {
+                    None
+                } else {
+                    Some(tabs.len() - 1)
+                }
+            })
         };
 
         self.pending_serialization = Some(cx.background_spawn(async move {
@@ -923,12 +831,14 @@ impl AgentPanel {
                             panel.selected_agent = agent_type;
                             panel.load_agent_thread(session_info, window, cx);
                         });
-                        // After loading the last tab, set the active index
+                        // After loading the last tab, restore active index and selected_agent
                         if is_last {
                             if let Some(active_idx) = saved_active_index {
                                 panel.update(cx, |panel, cx| {
                                     if active_idx < panel.tabs.len() {
                                         panel.activate_tab(active_idx, false, window, cx);
+                                        panel.selected_agent =
+                                            panel.tabs[active_idx].agent_type.clone();
                                     }
                                 });
                             }
@@ -1100,8 +1010,6 @@ impl AgentPanel {
             next_tab_id: 0,
             overlay_view: None,
             tab_scroll_handle: gpui::ScrollHandle::new(),
-            _active_tab_observation: None,
-            _active_tab_thread_subscription: None,
             background_threads: HashMap::default(),
             new_thread_menu_handle: PopoverMenuHandle::default(),
             start_thread_in_menu_handle: PopoverMenuHandle::default(),
@@ -1230,8 +1138,12 @@ impl AgentPanel {
     pub fn new_thread(&mut self, _action: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
         let opens_tab = AgentSettings::get_global(cx).new_thread_opens_tab;
         if !opens_tab && !self.tabs.is_empty() {
-            // Replace current tab: close it first, then create new
-            self.close_tab(self.active_tab_index, window, cx);
+            // Replace current tab in-place: retain running thread, remove tab
+            let old_tab = self.tabs.remove(self.active_tab_index);
+            if let AgentTabKind::AgentThread { server_view } = old_tab.kind {
+                self.retain_running_thread(ActiveView::AgentThread { server_view }, cx);
+            }
+            self.active_tab_index = self.active_tab_index.min(self.tabs.len().saturating_sub(1));
         }
         self.new_agent_thread(AgentType::NativeAgent, window, cx);
     }
@@ -1531,12 +1443,12 @@ impl AgentPanel {
     }
 
     pub fn go_back(&mut self, _: &workspace::GoBack, window: &mut Window, cx: &mut Context<Self>) {
-        // Try overlay system first
         if self.overlay_view.is_some() {
             self.dismiss_overlay(window, cx);
+            return;
         }
 
-        // Also handle old ActiveView-based overlay during transition
+        // Legacy path: active_view is History/Config without overlay
         match self.active_view {
             ActiveView::Configuration | ActiveView::History { .. } => {
                 if let Some(previous_view) = self.previous_view.take() {
@@ -2066,6 +1978,25 @@ impl AgentPanel {
 
     // ---- Tab management methods ----
 
+    /// Build an `ActiveView` from an `AgentTabKind`.
+    /// Used to keep `active_view` in sync with the tab system during transition.
+    fn active_view_from_kind(kind: &AgentTabKind) -> ActiveView {
+        match kind {
+            AgentTabKind::AgentThread { server_view } => ActiveView::AgentThread {
+                server_view: server_view.clone(),
+            },
+            AgentTabKind::TextThread {
+                text_thread_editor,
+                buffer_search_bar,
+                ..
+            } => ActiveView::TextThread {
+                text_thread_editor: text_thread_editor.clone(),
+                buffer_search_bar: buffer_search_bar.clone(),
+                _subscriptions: Vec::new(),
+            },
+        }
+    }
+
     fn add_tab(
         &mut self,
         kind: AgentTabKind,
@@ -2077,23 +2008,7 @@ impl AgentPanel {
         let id = AgentTabId(self.next_tab_id);
         self.next_tab_id += 1;
 
-        // Build the corresponding ActiveView for backward compat during transition
-        let active_view = match &kind {
-            AgentTabKind::AgentThread { server_view } => ActiveView::AgentThread {
-                server_view: server_view.clone(),
-            },
-            AgentTabKind::TextThread {
-                text_thread_editor,
-                title_editor,
-                buffer_search_bar,
-                _subscriptions,
-            } => ActiveView::TextThread {
-                text_thread_editor: text_thread_editor.clone(),
-                _title_editor: title_editor.clone(),
-                buffer_search_bar: buffer_search_bar.clone(),
-                _subscriptions: Vec::new(), // subscriptions are owned by AgentTabKind
-            },
-        };
+        let active_view = Self::active_view_from_kind(&kind);
 
         self.tabs.push(AgentTab {
             id,
@@ -2123,23 +2038,7 @@ impl AgentPanel {
         // Scroll the activated tab into view
         self.tab_scroll_handle.scroll_to_item(index);
 
-        // Update active_view for backward compat
-        let active_view = match &self.tabs[index].kind {
-            AgentTabKind::AgentThread { server_view } => ActiveView::AgentThread {
-                server_view: server_view.clone(),
-            },
-            AgentTabKind::TextThread {
-                text_thread_editor,
-                title_editor,
-                buffer_search_bar,
-                ..
-            } => ActiveView::TextThread {
-                text_thread_editor: text_thread_editor.clone(),
-                _title_editor: title_editor.clone(),
-                buffer_search_bar: buffer_search_bar.clone(),
-                _subscriptions: Vec::new(),
-            },
-        };
+        let active_view = Self::active_view_from_kind(&self.tabs[index].kind);
         self.set_active_view(active_view, focus, window, cx);
     }
 
@@ -2156,22 +2055,10 @@ impl AgentPanel {
 
         if self.tabs.is_empty() {
             self.active_tab_index = 0;
-            // Show history when last tab is closed
-            self.active_view = ActiveView::Uninitialized;
-            self.show_overlay(
-                OverlayView::History {
-                    kind: self
-                        .history_kind_for_selected_agent(cx)
-                        .unwrap_or(HistoryKind::AgentThreads),
-                },
-                false,
-                window,
-                cx,
-            );
-            // Also set via old path for compat
             let kind = self
                 .history_kind_for_selected_agent(cx)
                 .unwrap_or(HistoryKind::AgentThreads);
+            self.show_overlay(OverlayView::History { kind }, false, window, cx);
             self.set_active_view(ActiveView::History { kind }, false, window, cx);
         } else {
             self.active_tab_index = index.min(self.tabs.len() - 1);
@@ -2215,93 +2102,12 @@ impl AgentPanel {
             self.overlay_view = None;
             // Restore active_view to match the active tab
             if let Some(tab) = self.tabs.get(self.active_tab_index) {
-                let active_view = match &tab.kind {
-                    AgentTabKind::AgentThread { server_view } => ActiveView::AgentThread {
-                        server_view: server_view.clone(),
-                    },
-                    AgentTabKind::TextThread {
-                        text_thread_editor,
-                        title_editor,
-                        buffer_search_bar,
-                        ..
-                    } => ActiveView::TextThread {
-                        text_thread_editor: text_thread_editor.clone(),
-                        _title_editor: title_editor.clone(),
-                        buffer_search_bar: buffer_search_bar.clone(),
-                        _subscriptions: Vec::new(),
-                    },
-                };
+                let active_view = Self::active_view_from_kind(&tab.kind);
                 self.set_active_view(active_view, true, window, cx);
             } else {
-                self.refresh_active_tab_subscriptions(window, cx);
-                cx.emit(AgentPanelEvent::ActiveViewChanged);
-                cx.notify();
+                // No tabs open — set_active_view handles subscription cleanup
+                self.set_active_view(ActiveView::Uninitialized, false, window, cx);
             }
-        }
-    }
-
-    fn refresh_active_tab_subscriptions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get(self.active_tab_index) {
-            match &tab.kind {
-                AgentTabKind::AgentThread { server_view } => {
-                    self._active_tab_thread_subscription =
-                        Self::subscribe_to_active_thread_view(server_view, window, cx);
-                    let focus_handle = server_view.focus_handle(cx);
-                    self._active_thread_focus_subscription =
-                        Some(cx.on_focus_in(&focus_handle, window, |_this, _window, cx| {
-                            cx.emit(AgentPanelEvent::ThreadFocused);
-                            cx.notify();
-                        }));
-                    self._active_tab_observation = Some(cx.observe_in(
-                        server_view,
-                        window,
-                        |this, server_view, window, cx| {
-                            this._active_tab_thread_subscription =
-                                Self::subscribe_to_active_thread_view(&server_view, window, cx);
-                            cx.emit(AgentPanelEvent::ActiveViewChanged);
-                            this.serialize(cx);
-                            cx.notify();
-                        },
-                    ));
-                }
-                AgentTabKind::TextThread { .. } => {
-                    self._active_tab_observation = None;
-                    self._active_tab_thread_subscription = None;
-                    self._active_thread_focus_subscription = None;
-                }
-            }
-        } else {
-            self._active_tab_observation = None;
-            self._active_tab_thread_subscription = None;
-            self._active_thread_focus_subscription = None;
-        }
-    }
-
-    #[allow(dead_code)]
-    fn effective_view(&self) -> EffectiveView<'_> {
-        if let Some(overlay) = &self.overlay_view {
-            match overlay {
-                OverlayView::History { kind } => EffectiveView::History { kind: *kind },
-                OverlayView::Configuration => EffectiveView::Configuration,
-            }
-        } else if let Some(tab) = self.tabs.get(self.active_tab_index) {
-            match &tab.kind {
-                AgentTabKind::AgentThread { server_view } => {
-                    EffectiveView::AgentThread { server_view }
-                }
-                AgentTabKind::TextThread {
-                    text_thread_editor,
-                    title_editor,
-                    buffer_search_bar,
-                    ..
-                } => EffectiveView::TextThread {
-                    text_thread_editor,
-                    title_editor,
-                    buffer_search_bar,
-                },
-            }
-        } else {
-            EffectiveView::Uninitialized
         }
     }
 
@@ -4462,6 +4268,7 @@ impl AgentPanel {
     fn render_inline_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let tab_count = self.tabs.len();
         let active_index = self.active_tab_index;
+        let agent_server_store = self.project.read(cx).agent_server_store().clone();
 
         let tabs: Vec<_> = self
             .tabs
@@ -4475,6 +4282,30 @@ impl AgentPanel {
                     } => text_thread_editor.read(cx).title(cx),
                 };
 
+                // Resolve agent icon for custom/external agents
+                let tab_icon: Option<AnyElement> = match &tab.agent_type {
+                    AgentType::Custom { name } => {
+                        let store = agent_server_store.read(cx);
+                        let icon_path = store.agent_icon(&ExternalAgentServerName(name.clone()));
+                        if let Some(icon_path) = icon_path {
+                            Some(
+                                Icon::from_external_svg(icon_path)
+                                    .color(Color::Muted)
+                                    .size(IconSize::Small)
+                                    .into_any_element(),
+                            )
+                        } else {
+                            Some(
+                                Icon::new(IconName::Sparkle)
+                                    .color(Color::Muted)
+                                    .size(IconSize::Small)
+                                    .into_any_element(),
+                            )
+                        }
+                    }
+                    _ => None,
+                };
+
                 let is_active = ix == active_index;
                 let position = if ix == 0 {
                     TabPosition::First
@@ -4484,10 +4315,15 @@ impl AgentPanel {
                     TabPosition::Middle(ix.cmp(&active_index))
                 };
 
+                let tab_content = h_flex()
+                    .gap(DynamicSpacing::Base04.rems(cx))
+                    .children(tab_icon)
+                    .child(Label::new(title).size(LabelSize::Small));
+
                 Tab::new(("agent-tab", ix))
                     .position(position)
                     .toggle_state(is_active)
-                    .child(Label::new(title).size(LabelSize::Small))
+                    .child(tab_content)
                     .end_slot(
                         IconButton::new(("close-tab", ix), IconName::Close)
                             .icon_size(IconSize::XSmall)
@@ -4527,70 +4363,6 @@ impl AgentPanel {
                     .children(tabs),
             )
             .into_any()
-    }
-
-    #[allow(dead_code)]
-    fn render_tab_bar(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.tabs.is_empty() {
-            return div().into_any_element();
-        }
-
-        let tab_count = self.tabs.len();
-        let active_index = self.active_tab_index;
-
-        let tabs: Vec<_> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(ix, tab)| {
-                let title: SharedString = match &tab.kind {
-                    AgentTabKind::AgentThread { server_view } => server_view.read(cx).title(cx),
-                    AgentTabKind::TextThread {
-                        text_thread_editor, ..
-                    } => text_thread_editor.read(cx).title(cx),
-                };
-
-                let is_active = ix == active_index;
-                let position = if tab_count == 1 {
-                    TabPosition::First
-                } else if ix == 0 {
-                    TabPosition::First
-                } else if ix == tab_count - 1 {
-                    TabPosition::Last
-                } else {
-                    TabPosition::Middle(ix.cmp(&active_index))
-                };
-
-                Tab::new(("agent-tab", ix))
-                    .position(position)
-                    .toggle_state(is_active)
-                    .child(Label::new(title).size(LabelSize::Small))
-                    .end_slot(
-                        IconButton::new(("close-tab", ix), IconName::Close)
-                            .icon_size(IconSize::XSmall)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.close_tab(ix, window, cx);
-                            })),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.activate_tab(ix, true, window, cx);
-                    }))
-                    .into_any_element()
-            })
-            .collect();
-
-        TabBar::new("agent-panel-tab-bar")
-            .track_scroll(&self.tab_scroll_handle)
-            .children(tabs)
-            .end_child(
-                IconButton::new("new-tab", IconName::Plus)
-                    .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text("New Thread"))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.new_thread(&NewThread, window, cx);
-                    })),
-            )
-            .into_any_element()
     }
 }
 
