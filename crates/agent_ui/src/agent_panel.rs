@@ -1345,6 +1345,15 @@ impl AgentPanel {
             return;
         };
 
+        // Toggle: if history overlay of same kind is already showing, dismiss it
+        if let Some(OverlayView::History { kind: active_kind }) = &self.overlay_view {
+            if *active_kind == kind {
+                self.dismiss_overlay(window, cx);
+                return;
+            }
+        }
+
+        // Also handle old ActiveView-based check during transition
         if let ActiveView::History { kind: active_kind } = self.active_view {
             if active_kind == kind {
                 if let Some(previous_view) = self.previous_view.take() {
@@ -1354,6 +1363,8 @@ impl AgentPanel {
             }
         }
 
+        self.show_overlay(OverlayView::History { kind }, true, window, cx);
+        // Also update active_view for backward compat during transition
         self.set_active_view(ActiveView::History { kind }, true, window, cx);
         cx.notify();
     }
@@ -1407,6 +1418,12 @@ impl AgentPanel {
     }
 
     pub fn go_back(&mut self, _: &workspace::GoBack, window: &mut Window, cx: &mut Context<Self>) {
+        // Try overlay system first
+        if self.overlay_view.is_some() {
+            self.dismiss_overlay(window, cx);
+        }
+
+        // Also handle old ActiveView-based overlay during transition
         match self.active_view {
             ActiveView::Configuration | ActiveView::History { .. } => {
                 if let Some(previous_view) = self.previous_view.take() {
@@ -1536,6 +1553,8 @@ impl AgentPanel {
         let context_server_store = self.project.read(cx).context_server_store();
         let fs = self.fs.clone();
 
+        self.show_overlay(OverlayView::Configuration, true, window, cx);
+        // Also update active_view for backward compat during transition
         self.set_active_view(ActiveView::Configuration, true, window, cx);
         self.configuration = Some(cx.new(|cx| {
             AgentConfiguration::new(
