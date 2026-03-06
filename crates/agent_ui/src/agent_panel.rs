@@ -569,6 +569,23 @@ enum OverlayView {
     Configuration,
 }
 
+/// What to actually display — resolved from overlay + active tab.
+enum EffectiveView<'a> {
+    Uninitialized,
+    AgentThread {
+        server_view: &'a Entity<ConnectionView>,
+    },
+    TextThread {
+        text_thread_editor: &'a Entity<TextThreadEditor>,
+        title_editor: &'a Entity<Editor>,
+        buffer_search_bar: &'a Entity<BufferSearchBar>,
+    },
+    History {
+        kind: HistoryKind,
+    },
+    Configuration,
+}
+
 pub struct AgentPanel {
     workspace: WeakEntity<Workspace>,
     /// Workspace id is used as a database key
@@ -1871,6 +1888,188 @@ impl AgentPanel {
             self.focus_handle(cx).focus(window, cx);
         }
         cx.emit(AgentPanelEvent::ActiveViewChanged);
+    }
+
+    // ---- Tab management methods ----
+
+    fn add_tab(
+        &mut self,
+        kind: AgentTabKind,
+        agent_type: AgentType,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = AgentTabId(self.next_tab_id);
+        self.next_tab_id += 1;
+        self.tabs.push(AgentTab {
+            id,
+            kind,
+            agent_type,
+        });
+        self.active_tab_index = self.tabs.len() - 1;
+        self.overlay_view = None;
+        self.refresh_active_tab_subscriptions(window, cx);
+        if focus {
+            self.focus_handle(cx).focus(window, cx);
+        }
+        cx.emit(AgentPanelEvent::ActiveViewChanged);
+        self.serialize(cx);
+        cx.notify();
+    }
+
+    fn activate_tab(
+        &mut self,
+        index: usize,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        self.active_tab_index = index;
+        self.overlay_view = None;
+        self.refresh_active_tab_subscriptions(window, cx);
+        if focus {
+            self.focus_handle(cx).focus(window, cx);
+        }
+        cx.emit(AgentPanelEvent::ActiveViewChanged);
+        self.serialize(cx);
+        cx.notify();
+    }
+
+    fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let removed = self.tabs.remove(index);
+        // Retain running agent threads as background threads
+        if let AgentTabKind::AgentThread { server_view } = removed.kind {
+            let active_view = ActiveView::AgentThread { server_view };
+            self.retain_running_thread(active_view, cx);
+        }
+
+        if self.tabs.is_empty() {
+            self.active_tab_index = 0;
+            // Show history when last tab is closed
+            self.show_overlay(
+                OverlayView::History {
+                    kind: self
+                        .history_kind_for_selected_agent(cx)
+                        .unwrap_or(HistoryKind::AgentThreads),
+                },
+                false,
+                window,
+                cx,
+            );
+        } else {
+            self.active_tab_index = index.min(self.tabs.len() - 1);
+            self.refresh_active_tab_subscriptions(window, cx);
+        }
+        cx.emit(AgentPanelEvent::ActiveViewChanged);
+        self.serialize(cx);
+        cx.notify();
+    }
+
+    fn show_overlay(
+        &mut self,
+        overlay: OverlayView,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_agent_history = matches!(
+            overlay,
+            OverlayView::History {
+                kind: HistoryKind::AgentThreads
+            }
+        );
+        self.overlay_view = Some(overlay);
+
+        if is_agent_history {
+            self.acp_history
+                .update(cx, |history, cx| history.refresh_full_history(cx));
+        }
+
+        if focus {
+            self.focus_handle(cx).focus(window, cx);
+        }
+        cx.emit(AgentPanelEvent::ActiveViewChanged);
+        cx.notify();
+    }
+
+    fn dismiss_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay_view.is_some() {
+            self.overlay_view = None;
+            self.refresh_active_tab_subscriptions(window, cx);
+            cx.emit(AgentPanelEvent::ActiveViewChanged);
+            cx.notify();
+        }
+    }
+
+    fn refresh_active_tab_subscriptions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get(self.active_tab_index) {
+            match &tab.kind {
+                AgentTabKind::AgentThread { server_view } => {
+                    self._active_tab_thread_subscription =
+                        Self::subscribe_to_active_thread_view(server_view, window, cx);
+                    let focus_handle = server_view.focus_handle(cx);
+                    self._active_thread_focus_subscription =
+                        Some(cx.on_focus_in(&focus_handle, window, |_this, _window, cx| {
+                            cx.emit(AgentPanelEvent::ThreadFocused);
+                            cx.notify();
+                        }));
+                    self._active_tab_observation = Some(cx.observe_in(
+                        server_view,
+                        window,
+                        |this, server_view, window, cx| {
+                            this._active_tab_thread_subscription =
+                                Self::subscribe_to_active_thread_view(&server_view, window, cx);
+                            cx.emit(AgentPanelEvent::ActiveViewChanged);
+                            this.serialize(cx);
+                            cx.notify();
+                        },
+                    ));
+                }
+                AgentTabKind::TextThread { .. } => {
+                    self._active_tab_observation = None;
+                    self._active_tab_thread_subscription = None;
+                    self._active_thread_focus_subscription = None;
+                }
+            }
+        } else {
+            self._active_tab_observation = None;
+            self._active_tab_thread_subscription = None;
+            self._active_thread_focus_subscription = None;
+        }
+    }
+
+    fn effective_view(&self) -> EffectiveView<'_> {
+        if let Some(overlay) = &self.overlay_view {
+            match overlay {
+                OverlayView::History { kind } => EffectiveView::History { kind: *kind },
+                OverlayView::Configuration => EffectiveView::Configuration,
+            }
+        } else if let Some(tab) = self.tabs.get(self.active_tab_index) {
+            match &tab.kind {
+                AgentTabKind::AgentThread { server_view } => {
+                    EffectiveView::AgentThread { server_view }
+                }
+                AgentTabKind::TextThread {
+                    text_thread_editor,
+                    title_editor,
+                    buffer_search_bar,
+                    ..
+                } => EffectiveView::TextThread {
+                    text_thread_editor,
+                    title_editor,
+                    buffer_search_bar,
+                },
+            }
+        } else {
+            EffectiveView::Uninitialized
+        }
     }
 
     fn populate_recently_updated_menu_section(
